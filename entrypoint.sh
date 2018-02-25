@@ -52,10 +52,10 @@ case ${1} in
         exec python -m rasa_nlu.server "${@:2}"
         ;;
     train-rasa-core)
-        exec python -m rasa_core.train "${a:2}"
+        exec python -m rasa_core.train "${@:2}"
         ;;
     run-rasa-core)
-        exec python -m rasa_core.run "${a:2}"
+        exec python -m rasa_core.run "${@:2}"
         ;;
     *)
         print_help
