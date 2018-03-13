@@ -13,6 +13,13 @@ The recommended way to install Rasa Core is using pip:
 
     pip install rasa_core
 
+If you alredy have `rasa_core` installed and want to update it run:
+
+.. code-block:: bash
+
+    pip install -U rasa_core
+
+
 Unless you've already got numpy & scipy installed, we highly recommend 
 that you install and use `Anaconda <https://www.continuum.io\/downloads>`_.
 
@@ -33,6 +40,7 @@ If you want to use the bleeding edge version of Rasa use github + setup.py:
     .. code-block:: bash
 
         pip install -r dev-requirements.txt
+        pip install -e .
 
 
 Add Natural Language Understanding

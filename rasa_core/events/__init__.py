@@ -3,14 +3,16 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
+import datetime
 import json
 import logging
-import uuid
 import time
+import uuid
 
 import jsonpickle
 import typing
 from builtins import str
+from typing import List, Dict, Text, Any
 
 from rasa_core import utils
 
@@ -18,6 +20,19 @@ if typing.TYPE_CHECKING:
     from rasa_core.trackers import DialogueStateTracker
 
 logger = logging.getLogger(__name__)
+
+
+def deserialise_events(serialized_events):
+    # type: (List[Dict[Text, Any]]) -> List[Event]
+    """Convert a list of dictionaries to a list of corresponding events.
+
+    Example format:
+        [{"event": "set_slot", "value": 5, "name": "my_slot"}]
+    """
+
+    return [Event.from_parameters(e)
+            for e in serialized_events
+            if "event" in e]
 
 
 # noinspection PyProtectedMember
@@ -45,17 +60,23 @@ class Event(object):
         raise NotImplementedError
 
     @staticmethod
-    def from_story_string(event_name, parameters, domain, default=None):
+    def from_story_string(event_name, parameters, default=None):
         event = Event.resolve_by_type(event_name, default)
-        return event._from_story_string(event_name, parameters, domain)
+        return event._from_story_string(parameters)
 
     @staticmethod
-    def from_parameters(event_name, parameters, domain, default=None):
-        event = Event.resolve_by_type(event_name, default)
-        return event._from_parameters(event_name, parameters, domain)
+    def from_parameters(parameters, default=None):
+        event_name = parameters.get("event")
+        if event_name is not None:
+            copied = parameters.copy()
+            del copied["event"]
+            event = Event.resolve_by_type(event_name, default)
+            return event._from_parameters(parameters)
+        else:
+            return None
 
     @classmethod
-    def _from_story_string(cls, event_name, parameters, domain):
+    def _from_story_string(cls, parameters):
         """Called to convert a parsed story line into an event."""
         return cls(parameters.get("timestamp"))
 
@@ -66,7 +87,7 @@ class Event(object):
         }
 
     @classmethod
-    def _from_parameters(cls, event_name, parameters, domain):
+    def _from_parameters(cls, parameters):
         """Called to convert a dictionary of parameters to an event.
 
         By default uses the same implementation as the story line
@@ -74,7 +95,7 @@ class Event(object):
         decide to handle parameters differently if the parsed parameters
         don't origin from a story file."""
 
-        return cls._from_story_string(event_name, parameters, domain)
+        return cls._from_story_string(parameters)
 
     @staticmethod
     def resolve_by_type(type_name, default=None):
@@ -122,7 +143,7 @@ class UserUttered(Event):
         super(UserUttered, self).__init__(timestamp)
 
     @staticmethod
-    def from_parse_data(text, parse_data, timestamp=None):
+    def _from_parse_data(text, parse_data, timestamp=None):
         return UserUttered(text, parse_data["intent"], parse_data["entities"],
                            parse_data,
                            timestamp)
@@ -157,11 +178,11 @@ class UserUttered(Event):
         return d
 
     @classmethod
-    def _from_parameters(cls, event_name, parameters, domain):
+    def _from_story_string(cls, parameters):
         try:
-            return UserUttered.from_parse_data(parameters.get("text"),
-                                               parameters.get("parse_data"),
-                                               parameters.get("timestamp"))
+            return cls._from_parse_data(parameters.get("text"),
+                                        parameters.get("parse_data"),
+                                        parameters.get("timestamp"))
         except KeyError as e:
             raise ValueError("Failed to parse bot uttered event. {}".format(e))
 
@@ -235,7 +256,7 @@ class BotUttered(Event):
         return d
 
     @classmethod
-    def _from_parameters(cls, event_name, parameters, domain):
+    def _from_parameters(cls, parameters):
         try:
             return BotUttered(parameters.get("text"),
                               parameters.get("data"),
@@ -272,7 +293,7 @@ class TopicSet(Event):
         return "{name}[{props}]".format(name=self.type_name, props=self.topic)
 
     @classmethod
-    def _from_story_string(cls, event_name, parameters, domain):
+    def _from_story_string(cls, parameters):
         topic = list(parameters.keys())[0] if parameters else ""
         return TopicSet(topic)
 
@@ -282,7 +303,7 @@ class TopicSet(Event):
         return d
 
     @classmethod
-    def _from_parameters(cls, event_name, parameters, domain):
+    def _from_parameters(cls, parameters):
         try:
             return TopicSet(parameters.get("topic"),
                             parameters.get("timestamp"))
@@ -324,7 +345,7 @@ class SlotSet(Event):
         return "{name}{props}".format(name=self.type_name, props=props)
 
     @classmethod
-    def _from_story_string(cls, event_name, parameters, domain):
+    def _from_story_string(cls, parameters):
         slot_key = list(parameters.keys())[0] if parameters else None
         if slot_key:
             return SlotSet(slot_key, parameters[slot_key])
@@ -340,7 +361,7 @@ class SlotSet(Event):
         return d
 
     @classmethod
-    def _from_parameters(cls, event_name, parameters, domain):
+    def _from_parameters(cls, parameters):
         try:
             return SlotSet(parameters.get("name"),
                            parameters.get("value"),
@@ -375,8 +396,6 @@ class Restarted(Event):
     def apply_to(self, tracker):
         from rasa_core.actions.action import ActionListen
         tracker._reset()
-        # will be the index of the first event after the restart
-        tracker.latest_restart_event = len(tracker.events) + 1
         tracker.follow_up_action = ActionListen()
 
 
@@ -474,23 +493,34 @@ class ReminderScheduled(Event):
                 "action: {}, trigger_date: {}, name: {}"
                 ")".format(self.action_name, self.trigger_date_time, self.name))
 
-    def as_story_string(self):
-        props = json.dumps({
+    def _data_obj(self):
+        return {
             "action": self.action_name,
-            "date_time": self.trigger_date_time,
+            "date_time": self.trigger_date_time.isoformat(),
             "name": self.name,
-            "kill_on_user_msg": self.kill_on_user_message})
+            "kill_on_user_msg": self.kill_on_user_message
+        }
+
+    def as_story_string(self):
+        props = json.dumps(self._data_obj())
         return "{name}{props}".format(name=self.type_name, props=props)
 
     def as_dict(self):
-        raise NotImplementedError()
+        d = super(ReminderScheduled, self).as_dict()
+        d.update(self._data_obj())
+        return d
 
     @classmethod
-    def _from_story_string(cls, event_name, parameters, domain):
+    def _parse_trigger_time(self, date_time):
+        return datetime.datetime.strptime(date_time[:19], '%Y-%m-%dT%H:%M:%S')
+
+    @classmethod
+    def _from_story_string(cls, parameters):
         logger.info("Reminders will be ignored during training, "
                     "which should be ok.")
+        trigger_date_time = cls._parse_trigger_time(parameters.get("date_time"))
         return ReminderScheduled(parameters.get("action"),
-                                 parameters.get("date_time"),
+                                 trigger_date_time,
                                  parameters.get("name", None),
                                  parameters.get("kill_on_user_msg", True),
                                  parameters.get("timestamp"))
@@ -632,14 +662,7 @@ class ActionExecuted(Event):
         return self.action_name
 
     @classmethod
-    def _from_story_string(cls, event_name, parameters, domain):
-        if event_name in domain.action_names:
-            return ActionExecuted(event_name, parameters.get("timestamp"))
-        else:
-            return None
-
-    @classmethod
-    def _from_parameters(cls, event_name, parameters, domain):
+    def _from_story_string(cls, parameters):
         return ActionExecuted(parameters.get("name"),
                               parameters.get("timestamp"))
 

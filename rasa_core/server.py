@@ -4,16 +4,23 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 import argparse
+import io
 import json
 import logging
+import os
+import tempfile
+import zipfile
+from functools import wraps
 
 from builtins import str
 from klein import Klein
 from typing import Union, Text, Optional
 
+from rasa_core import utils, events
 from rasa_core.agent import Agent
-from rasa_core.events import Event
 from rasa_core.interpreter import NaturalLanguageInterpreter
+from rasa_core.tracker_store import TrackerStore
+from rasa_core.trackers import DialogueStateTracker
 from rasa_core.version import __version__
 from rasa_nlu.server import check_cors, requires_auth
 
@@ -21,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 
 def create_argument_parser():
+    """Parse all the command line arguments for the server script."""
+
     parser = argparse.ArgumentParser(
             description='starts server to serve an agent')
     parser.add_argument(
@@ -54,36 +63,8 @@ def create_argument_parser():
             default="rasa_core.log",
             help="store log file in specified file")
 
-    # arguments for logging configuration
-    parser.add_argument(
-            '--debug',
-            help="Print lots of debugging statements. "
-                 "Sets logging level to DEBUG",
-            action="store_const",
-            dest="loglevel",
-            const=logging.DEBUG,
-            default=logging.WARNING,
-    )
-    parser.add_argument(
-            '-v', '--verbose',
-            help="Be verbose. Sets logging level to INFO",
-            action="store_const",
-            dest="loglevel",
-            const=logging.INFO,
-    )
+    utils.add_logging_option_arguments(parser)
     return parser
-
-
-def convert_obj_2_tracker_events(serialized_events, domain):
-    # Example format: {"event": "set_slot", "value": 5, "name": "my_slot"}
-
-    deserialized = []
-    for e in serialized_events:
-        etype = e.get("event")
-        if etype is not None:
-            del e["event"]
-            deserialized.append(Event.from_parameters(etype, e, domain))
-    return deserialized
 
 
 def _configure_logging(loglevel, logfile):
@@ -92,6 +73,35 @@ def _configure_logging(loglevel, logfile):
         fh.setLevel(loglevel)
         logging.getLogger('').addHandler(fh)
     logging.captureWarnings(True)
+
+
+def ensure_loaded_agent(f):
+    """Wraps a request handler ensuring there is a loaded and usable model."""
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        self = args[0]
+        request = args[1]
+
+        if not self.agent:
+            request.setResponseCode(503)
+            return ("No agent loaded. To continue processing, a model of a "
+                    "trained agent needs to be loaded.")
+
+        return f(*args, **kwargs)
+
+    return decorated
+
+
+def bool_arg(request, name, default=True):
+    # type: (Request, Text, bool) -> bool
+    """Return a passed boolean argument of the request or a default.
+
+    Checks the `name` parameter of the request if it contains a valid
+    boolean value. If not, `default` is returned."""
+
+    d = str(default)
+    return request.args.get(name, d).lower() == 'true'
 
 
 class RasaCoreServer(object):
@@ -105,24 +115,38 @@ class RasaCoreServer(object):
                  logfile="rasa_core.log",
                  cors_origins=None,
                  action_factory=None,
-                 auth_token=None):
+                 auth_token=None,
+                 tracker_store=None):
 
         _configure_logging(loglevel, logfile)
 
         self.config = {"cors_origins": cors_origins if cors_origins else [],
                        "token": auth_token}
+        self.model_directory = model_directory
+        self.interpreter = interpreter
+        self.tracker_store = tracker_store
+        self.action_factory = action_factory
         self.agent = self._create_agent(model_directory, interpreter,
-                                        action_factory)
+                                        action_factory, tracker_store)
 
     @staticmethod
     def _create_agent(
             model_directory,  # type: Text
             interpreter,  # type: Union[Text, NaturalLanguageInterpreter]
-            action_factory=None  # type: Optional[Text]
+            action_factory=None,  # type: Optional[Text]
+            tracker_store=None  # type: Optional[TrackerStore]
     ):
-        # type: (...) -> Agent
-        return Agent.load(model_directory, interpreter,
-                          action_factory=action_factory)
+        # type: (...) -> Optional[Agent]
+        try:
+
+            return Agent.load(model_directory, interpreter,
+                              tracker_store=tracker_store,
+                              action_factory=action_factory)
+        except Exception as e:
+            logger.warn("Failed to load any agent model. Running "
+                        "Rasa Core server with out loaded model now. {}"
+                        "".format(e))
+            return None
 
     @app.route("/",
                methods=['GET', 'OPTIONS'])
@@ -135,6 +159,7 @@ class RasaCoreServer(object):
                methods=['POST', 'OPTIONS'])
     @check_cors
     @requires_auth
+    @ensure_loaded_agent
     def continue_predicting(self, request, sender_id):
         """Continue a prediction started with parse.
 
@@ -150,12 +175,11 @@ class RasaCoreServer(object):
                 request.content.read().decode('utf-8', 'strict'))
         encoded_events = request_params.get("events", [])
         executed_action = request_params.get("executed_action", None)
-        events = convert_obj_2_tracker_events(encoded_events,
-                                              self.agent.domain)
+        evts = events.deserialise_events(encoded_events)
         try:
             response = self.agent.continue_message_handling(sender_id,
                                                             executed_action,
-                                                            events)
+                                                            evts)
         except ValueError as e:
             request.setResponseCode(400)
             return json.dumps({"error": e.message})
@@ -168,16 +192,16 @@ class RasaCoreServer(object):
     @app.route("/conversations/<sender_id>/tracker/events",
                methods=['POST', 'OPTIONS'])
     @check_cors
+    @ensure_loaded_agent
     def append_events(self, request, sender_id):
         """Append a list of events to the state of a conversation"""
 
         request.setHeader('Content-Type', 'application/json')
         request_params = json.loads(
                 request.content.read().decode('utf-8', 'strict'))
-        events = convert_obj_2_tracker_events(request_params,
-                                              self.agent.domain)
+        evts = events.deserialise_events(request_params)
         tracker = self.agent.tracker_store.get_or_create_tracker(sender_id)
-        for e in events:
+        for e in evts:
             tracker.update(e)
         self.agent.tracker_store.save(tracker)
         return json.dumps(tracker.current_state())
@@ -185,28 +209,39 @@ class RasaCoreServer(object):
     @app.route("/conversations/<sender_id>/tracker",
                methods=['GET', 'OPTIONS'])
     @check_cors
+    @ensure_loaded_agent
     def retrieve_tracker(self, request, sender_id):
         """Get a dump of a conversations tracker including its events."""
 
-        request.setHeader('Content-Type', 'application/json')
+        # parameters
+        use_history = bool_arg(request, 'ignore_restarts', default=False)
+        should_include_events = bool_arg(request, 'events', default=True)
+        until_time = request.args.get('until', None)
+
+        # retrieve tracker and set to requested state
         tracker = self.agent.tracker_store.get_or_create_tracker(sender_id)
-        return json.dumps(tracker.current_state(should_include_events=True))
+        if until_time is not None:
+            tracker = tracker.travel_back_in_time(float(until_time))
+
+        # dump and return tracker
+        state = tracker.current_state(
+                should_include_events=should_include_events,
+                only_events_after_latest_restart=use_history)
+        return json.dumps(state)
 
     @app.route("/conversations/<sender_id>/tracker",
                methods=['PUT', 'OPTIONS'])
     @check_cors
+    @ensure_loaded_agent
     def update_tracker(self, request, sender_id):
         """Use a list of events to set a conversations tracker to a state."""
 
         request.setHeader('Content-Type', 'application/json')
         request_params = json.loads(
                 request.content.read().decode('utf-8', 'strict'))
-        events = convert_obj_2_tracker_events(request_params,
-                                              self.agent.domain)
-
-        tracker = self.agent.tracker_store.init_tracker(sender_id)
-        for e in events:
-            tracker.update(e)
+        tracker = DialogueStateTracker.from_dict(sender_id,
+                                                 request_params,
+                                                 self.agent.domain)
         self.agent.tracker_store.save(tracker)
 
         # will override an existing tracker with the same id!
@@ -217,6 +252,7 @@ class RasaCoreServer(object):
                methods=['GET', 'POST', 'OPTIONS'])
     @check_cors
     @requires_auth
+    @ensure_loaded_agent
     def parse(self, request, sender_id):
         request.setHeader('Content-Type', 'application/json')
         if request.method.decode('utf-8', 'strict') == 'GET':
@@ -225,8 +261,14 @@ class RasaCoreServer(object):
                                                                'strict')
                 for key, value in request.args.items()}
         else:
-            request_params = json.loads(
-                    request.content.read().decode('utf-8', 'strict'))
+            content = request.content.read()
+            try:
+                request_params = json.loads(content.decode('utf-8', 'strict'))
+            except ValueError as e:
+                logger.error("Failed to decode json during parse request. "
+                             "Error: {}. Request content: "
+                             "'{}'".format(e, content))
+                raise
 
         if 'query' in request_params:
             message = request_params.pop('query')
@@ -246,13 +288,37 @@ class RasaCoreServer(object):
                          "parse: {}".format(e), exc_info=1)
             return json.dumps({"error": "{}".format(e)})
 
+    @app.route("/load", methods=['POST', 'OPTIONS'])
+    @check_cors
+    def load_model(self, request):
+        """Loads a zipped model, replacing the existing one."""
+
+        logger.info("Received new model through REST interface.")
+        zipped_path = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        zipped_path.close()
+
+        with io.open(zipped_path.name, 'wb') as f:
+            f.write(request.args[b'model'][0])
+        logger.debug("Downloaded model to {}".format(zipped_path.name))
+
+        zip_ref = zipfile.ZipFile(zipped_path.name, 'r')
+        zip_ref.extractall(self.model_directory)
+        zip_ref.close()
+        logger.debug("Unzipped model to {}".format(
+                os.path.abspath(self.model_directory)))
+
+        self.agent = self._create_agent(self.model_directory, self.interpreter,
+                                        self.action_factory, self.tracker_store)
+        logger.debug("Finished loading new agent.")
+        return json.dumps({'success': 1})
+
     @app.route("/version",
                methods=['GET', 'OPTIONS'])
     @check_cors
     def version(self, request):
-        """Respond with the version number of the installed Rasa Core."""
+        """respond with the version number of the installed rasa core."""
 
-        request.setHeader('Content-Type', 'application/json')
+        request.setHeader('content-type', 'application/json')
         return json.dumps({'version': __version__})
 
 
@@ -261,7 +327,7 @@ if __name__ == '__main__':
     arg_parser = create_argument_parser()
     cmdline_args = arg_parser.parse_args()
 
-    logging.basicConfig(level=cmdline_args.loglevel)
+    utils.configure_colored_logging(cmdline_args.loglevel)
 
     rasa = RasaCoreServer(cmdline_args.core,
                           cmdline_args.nlu,
