@@ -1,4 +1,4 @@
--r requirements_spacy_sklearn.txt
+-r requirements_mitie.txt
 
 # not sure why these need to be specified
 # with rasa_nlu and rasa_core installs
