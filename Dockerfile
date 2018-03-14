@@ -25,7 +25,7 @@ RUN pip install -r requirements/requirements_docker.txt
 ## mitie models
 RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends wget \
-    && wget -P data/ https://s3-eu-west-1.amazonaws.com/mitie/total_word_feature_extractor.dat \
+    && wget -P mitie/ https://s3-eu-west-1.amazonaws.com/mitie/total_word_feature_extractor.dat \
     && apt-get remove -y wget \
     && apt-get autoremove -y
 ## rasa core
