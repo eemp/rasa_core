@@ -1,3 +1,6 @@
+**NB: View the original repository!  Official dockerfile is available and an image is available on docker hub.  Please do not use this.**
+
+
 # Rasa Core
 [![Join the chat on Gitter](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/RasaHQ/rasa_core?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 [![Build Status](https://travis-ci.org/RasaHQ/rasa_core.svg?branch=master)](https://travis-ci.org/RasaHQ/rasa_core)
